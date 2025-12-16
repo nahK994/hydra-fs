@@ -1,140 +1,110 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"os"
-	"path/filepath"
+	"net/http"
 	"strconv"
-	"strings"
+
+	"github.com/gin-gonic/gin"
 )
 
-const dataDir = "data"
+const tcpAddr = "localhost:9000" // Phase 1 TCP file server
 
 func main() {
-	// Ensure data directory exists
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
-		log.Fatal(err)
-	}
+	r := gin.Default()
 
-	ln, err := net.Listen("tcp", ":9000")
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Println("File server listening on :9000")
+	r.POST("/files", uploadFile)
+	r.GET("/files/:name", getFile)
+	r.DELETE("/files/:name", deleteFile)
 
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			log.Println("accept error:", err)
-			continue
-		}
-		go handleConn(conn)
-	}
+	log.Println("HTTP gateway listening on :8080")
+	r.Run(":8080")
 }
 
-func handleConn(conn net.Conn) {
+// POST /files (multipart/form-data)
+func uploadFile(c *gin.Context) {
+	file, err := c.FormFile("file")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "file required"})
+		return
+	}
+
+	src, err := file.Open()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer src.Close()
+
+	conn, err := net.Dial("tcp", tcpAddr)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot connect to file server"})
+		return
+	}
 	defer conn.Close()
 
-	reader := bufio.NewReader(conn)
+	size := file.Size
 
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err != io.EOF {
-				log.Println("read error:", err)
-			}
-			return
-		}
+	// Send PUT header
+	io.WriteString(conn, "PUT "+file.Filename+" "+strconv.FormatInt(size, 10)+"\n")
 
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
+	// Send file bytes
+	io.Copy(conn, src)
 
-		parts := strings.Split(line, " ")
-		cmd := parts[0]
-
-		switch cmd {
-		case "PUT":
-			handlePut(parts, reader, conn)
-		case "GET":
-			handleGet(parts, conn)
-		case "DELETE":
-			handleDelete(parts, conn)
-		default:
-			fmt.Fprintln(conn, "ERR unknown command")
-		}
-	}
+	c.JSON(http.StatusOK, gin.H{"status": "uploaded"})
 }
 
-func handlePut(parts []string, reader *bufio.Reader, conn net.Conn) {
-	if len(parts) != 3 {
-		fmt.Fprintln(conn, "ERR usage: PUT <filename> <size>")
-		return
-	}
+// GET /files/:name
+func getFile(c *gin.Context) {
+	name := c.Param("name")
 
-	filename := filepath.Base(parts[1])
-	size, err := strconv.Atoi(parts[2])
-	if err != nil || size < 0 {
-		fmt.Fprintln(conn, "ERR invalid size")
-		return
-	}
-
-	path := filepath.Join(dataDir, filename)
-	file, err := os.Create(path)
+	conn, err := net.Dial("tcp", tcpAddr)
 	if err != nil {
-		fmt.Fprintln(conn, "ERR cannot create file")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot connect to file server"})
 		return
 	}
-	defer file.Close()
+	defer conn.Close()
 
-	_, err = io.CopyN(file, reader, int64(size))
+	io.WriteString(conn, "GET "+name+"\n")
+
+	// Read header: OK <size>\n
+	buf := make([]byte, 256)
+	n, err := conn.Read(buf)
 	if err != nil {
-		fmt.Fprintln(conn, "ERR failed to read data")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "read error"})
 		return
 	}
 
-	fmt.Fprintln(conn, "OK")
+	header := string(buf[:n])
+	var size int64
+	_, err = fmt.Sscanf(header, "OK %d", &size)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
+		return
+	}
+
+	c.Header("Content-Disposition", "attachment; filename="+name)
+	c.Header("Content-Length", strconv.FormatInt(size, 10))
+	c.Status(http.StatusOK)
+
+	io.CopyN(c.Writer, conn, size)
 }
 
-func handleGet(parts []string, conn net.Conn) {
-	if len(parts) != 2 {
-		fmt.Fprintln(conn, "ERR usage: GET <filename>")
-		return
-	}
+// DELETE /files/:name
+func deleteFile(c *gin.Context) {
+	name := c.Param("name")
 
-	filename := filepath.Base(parts[1])
-	path := filepath.Join(dataDir, filename)
-
-	file, err := os.Open(path)
+	conn, err := net.Dial("tcp", tcpAddr)
 	if err != nil {
-		fmt.Fprintln(conn, "ERR file not found")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot connect to file server"})
 		return
 	}
-	defer file.Close()
+	defer conn.Close()
 
-	info, _ := file.Stat()
-	fmt.Fprintf(conn, "OK %d\n", info.Size())
-	io.Copy(conn, file)
-}
+	io.WriteString(conn, "DELETE "+name+"\n")
 
-func handleDelete(parts []string, conn net.Conn) {
-	if len(parts) != 2 {
-		fmt.Fprintln(conn, "ERR usage: DELETE <filename>")
-		return
-	}
-
-	filename := filepath.Base(parts[1])
-	path := filepath.Join(dataDir, filename)
-
-	if err := os.Remove(path); err != nil {
-		fmt.Fprintln(conn, "ERR cannot delete file")
-		return
-	}
-
-	fmt.Fprintln(conn, "OK")
+	c.JSON(http.StatusOK, gin.H{"status": "deleted"})
 }
